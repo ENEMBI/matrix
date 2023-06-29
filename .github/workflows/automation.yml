@@ -1,0 +1,42 @@
+# This workflow will do a clean installation of node dependencies, cache/restore them, build the source code and run tests across different versions of node
+# For more information see: https://docs.github.com/en/actions/automating-builds-and-tests/building-and-testing-nodejs
+
+name: Playwright Automation
+
+on:
+    workflow_dispatch:
+jobs:
+    load-testing:
+        runs-on: ubuntu-latest
+        # strategy:
+        #     matrix:
+        #         users: 
+        #         # See supported Node.js release schedule at https://nodejs.org/en/about/releases/
+        steps:
+            - uses: actions/checkout@v3
+            - id: set_var
+              run: |
+                  content=`cat ./users.json`
+                  # the following lines are only required for multi line json
+                  content="${content//'%'/'%25'}"
+                  content="${content//$'\n'/'%0A'}"
+                  content="${content//$'\r'/'%0D'}"
+                  # end of optional handling for multi line json
+                  echo "::set-output name=users::$content"
+            - run: |
+                  echo "${{fromJson(steps.set_var.outputs.users)}}"
+            # - run: |
+            #     echo 'PACKAGE_JSON<<EOF' >> $GITHUB_ENV
+            #     cat ./package.json >> $GITHUB_ENV
+            #     echo 'EOF' >> $GITHUB_ENV
+            # - run: |
+            #     echo '${{ fromJson(env.PACKAGE_JSON).version }}'
+            # - name: get version
+            #   id: users
+            #   uses: notiz-dev/github-action-json-property@release
+            #   with:
+            #     path: 'users.json'
+            #     prop_path: 'users'
+            # - run: echo ${{steps.users.outputs.prop}}
+            # - name: Build
+            #   run: bash scripts/build.sh
