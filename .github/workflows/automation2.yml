@@ -22,8 +22,7 @@ jobs:
                   USER_EMAIL_1: ${{ matrix.users[1].email }}
                   USER_PWD_1: ${{ matrix.users[1].password }}
             - run: |
-                WORKERS=3
-                result=$(echo "[{ "email": "email1", "password": "password1" }, { "email": "email2", "password": "password2" }]" | jq -c --arg workers "$WORKERS" 'reduce range(0; length; . + $workers) as $i ([]; . + [.[ $i: $i + $workers ]])')
+                result=$(echo "[{ "email": "email1", "password": "password1" }, { "email": "email2", "password": "password2" }]" | jq -c --arg workers "3" 'reduce range(0; length; . + $workers) as $i ([]; . + [.[ $i: $i + $workers ]])')
                 echo "$result"
             # - id: set_var
             #   run: |
