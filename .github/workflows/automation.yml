@@ -25,6 +25,9 @@ jobs:
                   echo "::set-output name=users::$content"
             - run: |
                   echo "${{fromJson(steps.set_var.outputs.users)}}"
+                  echo "${{fromJson(steps.set_var.outputs.users[0])}}"
+                  echo "${{fromJson(steps.set_var.outputs.users[0].email)}}"
+                  echo "${{fromJson(steps.set_var.outputs.users[0].password)}}"
             # - run: |
             #     echo 'PACKAGE_JSON<<EOF' >> $GITHUB_ENV
             #     cat ./package.json >> $GITHUB_ENV
