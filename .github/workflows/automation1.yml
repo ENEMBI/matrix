@@ -10,7 +10,7 @@ jobs:
         runs-on: ubuntu-latest
         strategy:
             matrix:
-                users: [{ "email": "email1", "password": "password1" }, { "email": "email2", "password": "password2" }]
+                users: [[{ "email": "email1", "password": "password1" }, { "email": "email2", "password": "password2" }],[{ "email": "email3", "password": "password3" }, { "email": "email4", "password": "password4" }]]
 
                 # See supported Node.js release schedule at https://nodejs.org/en/about/releases/
         steps:
