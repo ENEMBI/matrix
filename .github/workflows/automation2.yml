@@ -10,23 +10,21 @@ jobs:
         runs-on: ubuntu-latest
         strategy:
             matrix:
-                users:
-                    [
-                        [{ "email": "email1", "password": "password1" }, { "email": "email2", "password": "password2" }],
-                        [{ "email": "email3", "password": "password3" }, { "email": "email4", "password": "password4" }],
-                    ]
-
-                # See supported Node.js release schedule at https://nodejs.org/en/about/releases/
+                users: [{ "email": "email1", "password": "password1" }, { "email": "email2", "password": "password2" }]   
         steps:
             - uses: actions/checkout@v3
+            - name: Install JQ Tool
+              uses: mbround18/install-jq@v1
             - run: echo "$USER_EMAIL_0 and $USER_PWD_0 and $USER_EMAIL_1 and $USER_PWD_1" # output for each separate run is "one is 1", "two is 2" and "three is 3"
               env:
                   USER_EMAIL_0: ${{ matrix.users[0].email }}
                   USER_PWD_0: ${{ matrix.users[0].password }}
                   USER_EMAIL_1: ${{ matrix.users[1].email }}
                   USER_PWD_1: ${{ matrix.users[1].password }}
-
-
+            - run: |
+                WORKERS=3
+                result=$(echo "${{matrix.users}}" | jq -c --arg workers "$WORKERS" 'reduce range(0; length; . + $workers) as $i ([]; . + [.[ $i: $i + $workers ]])')
+                echo "$result"
             # - id: set_var
             #   run: |
             #       content=`cat ./users.json`
