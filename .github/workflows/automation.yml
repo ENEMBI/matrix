@@ -13,11 +13,11 @@ on:
                     - stg
                     - prod
     schedule:
-        - cron: "* 5 * * *"
+        - cron: "5 * * * *"
     push:
         branches: ["main"]
 env:
-    ENV: ${{ inputs.ENV || github.event.schedule == '* 5 * * *' && 'prod' || 'stg' }}
+    ENV: ${{ inputs.ENV || github.event.schedule == '5 * * * *' && 'prod' || 'stg' }}
     GCP_PROJECT_ID: winn-ai-general
 jobs:
     load-testing:
