@@ -1,0 +1,394 @@
+name: reporter
+on:
+    #schedule:
+    #  - cron: '00 03 * * *'
+    workflow_dispatch:
+        inputs:
+            db-env:
+                type: choice
+                description: The environment of the DB to connect to
+                required: true
+                options:
+                    - dev
+                    - stg
+                    - stg-nlp
+            folder:
+                description: folder
+                default: '*'
+                required: true
+            sks_path:
+                type: choice
+                description: sks_path
+                required: false
+                options:
+                    - DB
+                    - meir
+                    - orr
+                    - ido
+                    - assaf
+
+run-name: Reporter ran by ${{ github.actor }} - env ${{ inputs.db-env }}, folder ${{ inputs.folder }}
+
+env:
+    GCP_PROJECT_ID: winn-ai-general
+    TRANSCRIPTS_BUCKET: gs://winn_reporter/transcripts
+    RESULTS_BUCKET: gs://winn_reporter/reports
+    SKS_BUCKET: gs://winn_reporter/sks_templates
+
+jobs:
+    get-params:
+        name: Get params
+        runs-on: ubuntu-latest
+        outputs:
+            timestamp: ${{ steps.get-timestamp.outputs.timestamp }}
+            results-folder: ${{ steps.get-timestamp.outputs.results-folder }}
+            base-folders: ${{ steps.get-groups.outputs.base-folders }}
+            file-groups: ${{ steps.get-groups.outputs.file-groups }}
+        steps:
+            - name: Get timestamp and Results folder
+              id: get-timestamp
+              env:
+                  REQUESTED_FOLDER: ${{ inputs.folder || '*' }}
+              run: |-
+                  TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+                  echo "Timestamp is: $TIMESTAMP"
+
+                  echo "timestamp=$TIMESTAMP" >> $GITHUB_OUTPUT
+
+                  if [[ "$REQUESTED_FOLDER" != "*" ]]; then
+                    FOLDER=${{ inputs.folder }}
+                  else
+                    FOLDER='all'
+                  fi
+
+                  RESULT_FOLDER="$TIMESTAMP"_${{ github.actor }}_${{ inputs.db-env }}_"$FOLDER"
+
+                  echo "Results folder is: $RESULT_FOLDER"
+
+                  echo "results-folder=$RESULT_FOLDER" >> $GITHUB_OUTPUT
+
+            - name: Authenticate to GCP
+              id: 'auth'
+              uses: 'google-github-actions/auth@v0'
+              with:
+                  credentials_json: '${{ secrets.DOCKER_IMAGES_REGISTRY_KEY }}'
+
+            - name: Setup GCP Cloud SDK
+              uses: google-github-actions/setup-gcloud@v0
+              with:
+                  project_id: ${{ env.GCP_PROJECT_ID }}
+
+            - name: Get groups
+              id: get-groups
+              env:
+                  REQUESTED_FOLDER: ${{ inputs.folder || '*' }}
+              run: |-
+                  if [[ "$REQUESTED_FOLDER" != "*" ]]; then
+                    BASE_FOLDER_URLS=("$TRANSCRIPTS_BUCKET/$REQUESTED_FOLDER/")
+                  else
+                    BASE_FOLDER_URLS=($(gsutil ls gs://winn_reporter/transcripts/ | tail -n +2 | grep -v '^.*/\..*'))
+                  fi
+                  echo "Base folder URLs are: ${BASE_FOLDER_URLS[@]}"
+
+                  AGGREGATED_FILE_GROUPS=
+                  BASE_FOLDERS_ARR=()
+                  for FOLDER_URL in ${BASE_FOLDER_URLS[@]}; do 
+                    FOLDER_FILE_GROUPS=$(gsutil ls "${FOLDER_URL}**/*.xlsx" | jq -ncR '[inputs] | _nwise(2)')
+                    AGGREGATED_FILE_GROUPS="$AGGREGATED_FILE_GROUPS $FOLDER_FILE_GROUPS"
+
+                    BASE_FOLDER=$(echo ${FOLDER_URL} | sed -E "s#${TRANSCRIPTS_BUCKET}/([^/]+)/.*#\1#")
+                    BASE_FOLDERS_ARR+=("$BASE_FOLDER")
+                  done
+
+                  FILE_GROUPS=$(echo $AGGREGATED_FILE_GROUPS | jq -nc '[inputs]')
+
+                  echo "File groups are: $FILE_GROUPS"
+
+                  if [[ "$REQUESTED_FOLDER" == "*" ]]; then
+                    BASE_FOLDERS_ARR+=("*")
+                  fi
+
+                  BASE_FOLDERS=$(jq -nc '$ARGS.positional' --args -- "${BASE_FOLDERS_ARR[@]}")
+
+                  echo "Base folders are: ${BASE_FOLDERS[@]}"
+
+                  echo "base-folders=$BASE_FOLDERS" >> $GITHUB_OUTPUT
+                  echo "file-groups=$FILE_GROUPS" >> $GITHUB_OUTPUT
+
+    reporter-step1:
+        name: Reporter step 1
+        needs: get-params
+        runs-on: ubuntu-latest
+        continue-on-error: true
+        strategy:
+            matrix:
+                file-group: ${{ fromJSON(needs.get-params.outputs.file-groups) }}
+        steps:
+            - name: Pull Code
+              uses: actions/checkout@v3
+
+            - name: Authenticate to GCP
+              id: 'auth'
+              uses: 'google-github-actions/auth@v0'
+              with:
+                  credentials_json: '${{ secrets.DOCKER_IMAGES_REGISTRY_KEY }}'
+
+            - name: Setup GCP Cloud SDK
+              uses: google-github-actions/setup-gcloud@v0
+              with:
+                  project_id: ${{ env.GCP_PROJECT_ID }}
+
+            - name: Set up Python
+              uses: actions/setup-python@v4
+              with:
+                  python-version: '3.10'
+
+            - name: Install dependencies
+              run: |
+                  . ./dependencies.sh --dev
+
+            - name: Copy from bucket
+              id: copy-from-bucket
+              env:
+                  FILE_GROUP: ${{ toJSON(matrix.file-group) }}
+                  EXTERNAL_SKS_PATH: ${{ inputs.sks_path || 'DB' }}
+              run: |-
+                  IFS=$'\t' read -r -a FILES <<< $(echo $FILE_GROUP | jq -rc '. | @tsv')
+                  echo "Files are: ${FILES[@]}"
+
+                  # Copy reporter config from the base folder
+                  BASE_FOLDER=$(echo ${FILES[0]} | sed -E "s#${TRANSCRIPTS_BUCKET}/([^/]+)/.*#\1#")
+                  gsutil cp "$TRANSCRIPTS_BUCKET/$BASE_FOLDER/reporter_config.json" ./reporter_config.json
+
+                  echo "Base folder is: $BASE_FOLDER"
+                  echo "reporter_config.json is: $(cat ./reporter_config.json)"
+
+                  SKS_FILE_PATH=
+                  if [[ "$EXTERNAL_SKS_PATH" != "DB" ]]; then
+                    SKS_PATH=("$SKS_BUCKET/$EXTERNAL_SKS_PATH/sks_templates.json")
+                    SKS_FILE_PATH="./sks_templates.json"
+                    gsutil cp "$SKS_PATH" "$SKS_FILE_PATH"
+                  fi
+                  echo "sks-path=$SKS_FILE_PATH" >> $GITHUB_OUTPUT
+
+                  mkdir ./transcripts
+
+                  for FILE in "${FILES[@]}"
+                  do
+                    gsutil cp "$FILE" ./transcripts/
+                  done
+
+                  echo "base-folder=$BASE_FOLDER" >> $GITHUB_OUTPUT
+
+            - name: Get DB params
+              id: get-db-params
+              env:
+                  DB_ENV: ${{ inputs.db-env || 'stg-nlp' }}
+                  DB_USERNAME: ${{ secrets.MONGO_INITDB_ROOT_USERNAME }}
+                  DB_PASSWORD: ${{ secrets.MONGO_INITDB_ROOT_PASSWORD }}
+                  DB_HOST_DEV: ${{ secrets.MONGODB_HOST_DEV }}
+                  DB_HOST_STG: ${{ secrets.MONGODB_HOST_STG }}
+                  DB_HOST_STG_NLP: ${{ secrets.MONGODB_HOST_STG_NLP }}
+              run: |-
+                  if [[ "$DB_ENV" == "dev" ]]; then
+                    echo "Set DB params to DEV server"
+                    DB_HOST=$DB_HOST_DEV
+                  elif [[ "$DB_ENV" == "stg" ]]; then
+                    echo "Set DB params to STG server"
+                    DB_HOST=$DB_HOST_STG
+                  else
+                    echo "Set DB params to STG-NLP server"
+                    DB_HOST=$DB_HOST_STG_NLP
+                  fi
+
+                  echo "db-host=$DB_HOST" >> $GITHUB_OUTPUT
+                  echo "db-username=$DB_USERNAME" >> $GITHUB_OUTPUT
+                  echo "db-password=$DB_PASSWORD" >> $GITHUB_OUTPUT
+
+            - name: Run reporter step 1
+              env:
+                  MONGODB_HOST: ${{ steps.get-db-params.outputs.db-host }}
+                  MONGO_INITDB_ROOT_USERNAME: ${{ steps.get-db-params.outputs.db-username }}
+                  MONGO_INITDB_ROOT_PASSWORD: ${{ steps.get-db-params.outputs.db-password }}
+                  SKS_PATH: ${{ steps.copy-from-bucket.outputs.sks-path }}
+              run: |
+                  mkdir ./logs
+                  mkdir ./output
+
+                  CWD=$(pwd)
+                  sed -i "s#/app#$CWD#g" ./config/settings.json
+                  sed -i "s#/logs#$CWD/logs#g" ./config/settings.json
+
+                  echo "company is: ${{ steps.copy-from-bucket.outputs.base-folder }}"
+                  echo "SKS_PATH is: $SKS_PATH"
+
+                  python ./tools/nlp_reporter_step_1.py ./transcripts ./output ./reporter_config.json ${{ steps.copy-from-bucket.outputs.base-folder }} $SKS_PATH
+
+            - name: Copy temporary results to bucket
+              env:
+                  OUTPUT_BUCKET: ${{ env.RESULTS_BUCKET }}/${{ needs.get-params.outputs.results-folder }}/${{ steps.copy-from-bucket.outputs.base-folder }}
+              run: |
+                  echo "Copy to $OUTPUT_BUCKET"
+                  ls -lR ./output
+                  gsutil -m cp -r ./output/* $OUTPUT_BUCKET/
+                  gsutil -m cp -r ./logs $OUTPUT_BUCKET/
+                  gsutil -m cp -r ./reporter_config.json $OUTPUT_BUCKET/
+
+    reporter-step2:
+        name: Reporter step 2 on folder ${{ matrix.base-folder }}
+        needs:
+            - get-params
+            - reporter-step1
+        runs-on: ubuntu-latest
+        continue-on-error: true
+        strategy:
+            matrix:
+                base-folder: ${{ fromJSON(needs.get-params.outputs.base-folders) }}
+        steps:
+            - name: Pull Code
+              uses: actions/checkout@v3
+
+            - name: Authenticate to GCP
+              id: 'auth'
+              uses: 'google-github-actions/auth@v0'
+              with:
+                  credentials_json: '${{ secrets.DOCKER_IMAGES_REGISTRY_KEY }}'
+
+            - name: Setup GCP Cloud SDK
+              uses: google-github-actions/setup-gcloud@v0
+              with:
+                  project_id: ${{ env.GCP_PROJECT_ID }}
+
+            - name: Set up Python
+              uses: actions/setup-python@v4
+              with:
+                  python-version: '3.10'
+
+            - name: Install dependencies
+              run: |
+                  pip install -r requirements.txt --upgrade pip
+
+            - name: Copy from bucket
+              env:
+                  OUTPUT_BUCKET: ${{ env.RESULTS_BUCKET }}/${{ needs.get-params.outputs.results-folder }}/${{ matrix.base-folder }}
+              run: |-
+                  mkdir -p ./output/temp
+                  gsutil -m cp -r "$OUTPUT_BUCKET/temp/*" ./output/temp/
+                  gsutil -m cp -r "$OUTPUT_BUCKET/reporter_config.json" ./
+
+                  ls -lR ./output
+
+            - name: Get DB params
+              id: get-db-params
+              env:
+                  DB_ENV: ${{ inputs.db-env || 'stg-nlp' }}
+                  DB_USERNAME: ${{ secrets.MONGO_INITDB_ROOT_USERNAME }}
+                  DB_PASSWORD: ${{ secrets.MONGO_INITDB_ROOT_PASSWORD }}
+                  DB_HOST_DEV: ${{ secrets.MONGODB_HOST_DEV }}
+                  DB_HOST_STG: ${{ secrets.MONGODB_HOST_STG }}
+                  DB_HOST_STG_NLP: ${{ secrets.MONGODB_HOST_STG_NLP }}
+                  DB_NLP_USERNAME: ${{ secrets.MONGO_NLP_USERNAME }}
+                  DB_NLP_PASSWORD: ${{ secrets.MONGO_NLP_PASSWORD }}
+                  DB_NLP_HOST: ${{ secrets.MONGODB_HOST_NLP }}
+              run: |-
+                  if [[ "$DB_ENV" == "dev" ]]; then
+                    echo "Set DB params to DEV server"
+                    DB_HOST=$DB_HOST_DEV
+                  elif [[ "$DB_ENV" == "stg" ]]; then
+                    echo "Set DB params to STG server"
+                    DB_HOST=$DB_HOST_STG
+                  else
+                    echo "Set DB params to STG-NLP server"
+                    DB_HOST=$DB_HOST_STG_NLP
+                  fi
+
+
+                  echo "db-host=$DB_HOST" >> $GITHUB_OUTPUT
+                  echo "db-username=$DB_USERNAME" >> $GITHUB_OUTPUT
+                  echo "db-password=$DB_PASSWORD" >> $GITHUB_OUTPUT
+
+                  echo "db-nlp-host=$DB_NLP_HOST" >> $GITHUB_OUTPUT
+                  echo "db-nlp-username=$DB_NLP_USERNAME" >> $GITHUB_OUTPUT
+                  echo "db-nlp-password=$DB_NLP_PASSWORD" >> $GITHUB_OUTPUT
+
+            - name: Run reporter step 2
+              env:
+                  MONGODB_HOST: ${{ steps.get-db-params.outputs.db-host }}
+                  MONGO_INITDB_ROOT_USERNAME: ${{ steps.get-db-params.outputs.db-username }}
+                  MONGO_INITDB_ROOT_PASSWORD: ${{ steps.get-db-params.outputs.db-password }}
+                  MONGODB_NLP_HOST: ${{ steps.get-db-params.outputs.db-nlp-host }}
+                  MONGO_NLP_INITDB_ROOT_USERNAME: ${{ steps.get-db-params.outputs.db-nlp-username }}
+                  MONGO_NLP_INITDB_ROOT_PASSWORD: ${{ steps.get-db-params.outputs.db-nlp-password }}
+                  GITHUB_ACTION_EVENT_NAME: ${{ github.event_name }}
+                  GITHUB_ACTION_RESULT_DIR: ${{ needs.get-params.outputs.results-folder }}
+                  GITHUB_ACTION_ACTOR: ${{ github.actor }}
+                  GITHUB_ACTION_DB_ENV: ${{ inputs.db-env }}
+                  GITHUB_ACTION_RUN_ID: ${{ github.run_id }}
+                  GITHUB_ACTION_RUN_NUMBER: ${{ github.run_number }}
+              run: |
+                  mkdir ./logs
+                  CWD=$(pwd)
+                  sed -i "s#/app#$CWD#g" ./config/settings.json
+                  sed -i "s#/logs#$CWD/logs#g" ./config/settings.json
+
+                  COMPANY_NAME=${{ matrix.base-folder }}
+                  CONFIG_FILE="./reporter_config.json"
+                  if [[ "$COMPANY_NAME" == "*" ]]; then
+                    COMPANY_NAME=("ALL")
+                    CONFIG_FILE=""
+                  fi
+
+                  ACTION_REF="${{ github.head_ref }}"
+                  echo "company                                    is: $COMPANY_NAME"
+                  echo "github.event_name                          is: ${{ github.event_name }}"
+                  echo "needs.get-params.outputs.results-folder    is: ${{ needs.get-params.outputs.results-folder }}"
+                  echo "github.actor                               is: ${{ github.actor }}"
+                  echo "inputs.db-env                              is: ${{ inputs.db-env }}"
+                  echo "github.run_id                              is: ${{ github.run_id }}"
+                  echo "github.run_number                          is: ${{ github.run_number }}"
+                  echo "github.ref                                 is: ${{ github.ref }}"          
+
+
+                  env GITHUB_ACTION_REF="$ACTION_REF" python ./tools/nlp_reporter_step_2.py ./output $COMPANY_NAME ${{ github.event_name }} $CONFIG_FILE
+                  rm -rf ./output/temp
+
+            - name: Copy final results to bucket
+              env:
+                  OUTPUT_BUCKET: ${{ env.RESULTS_BUCKET }}/${{ needs.get-params.outputs.results-folder }}
+                  OUTPUT_FOLDER: ${{ matrix.base-folder }}
+              run: |
+                  if [[ "$OUTPUT_FOLDER" != "*" ]]; then
+                    gsutil -m cp -r ./output/* $OUTPUT_BUCKET/$OUTPUT_FOLDER/
+                    RESULT_STATS_FILE="$OUTPUT_BUCKET"/stats/"$OUTPUT_FOLDER"_business_stats.csv
+                    echo "Result stats is: $RESULT_STATS_FILE"
+                    gsutil -m cp ./output/business_stats.csv $RESULT_STATS_FILE
+                  else
+                    mkdir -p ./output/stats
+                    gsutil -m cp -r "$OUTPUT_BUCKET/stats/*" ./output/stats/
+
+                    head -n 1 ./output/business_stats.csv > ./output/final_business_stats_tmp.csv
+                    for FILE in ./output/stats/*_business_stats.csv; do 
+                      awk 'NR>2 {print last} {last=$0}' "$FILE" >> ./output/final_business_stats_tmp.csv
+                    done
+                    tail -1 ./output/business_stats.csv >> ./output/final_business_stats_tmp.csv
+
+                    awk -v n=-1 -F, -v OFS="," '{$1=(n++ < 0 ? "" : n-1); print}' ./output/final_business_stats_tmp.csv > ./output/final_business_stats.csv
+                    rm -f ./output/final_business_stats_tmp.csv
+                    cp -r ./output/business_stats.csv ./output/reports_${{ needs.get-params.outputs.timestamp }}_*_stats.csv; 
+                    gsutil -m cp -r ./output/* $OUTPUT_BUCKET/
+                    gsutil cp ./output/reports_${{ needs.get-params.outputs.timestamp }}_*_stats.csv  $RESULTS_BUCKET/daily_biz_report
+                    gsutil cp ./output/stats.xlsx $RESULTS_BUCKET/stats.xlsx
+                    gsutil cp ./output/stats.csv $RESULTS_BUCKET/stats.csv
+                    cd output;ls
+                  fi
+
+            - name: Upload  final results to slack
+              if: ${{ github.event_name == 'schedule' }}
+              uses: MeilCli/slack-upload-file@v2
+              with:
+                  slack_token: ${{ secrets.SLACK_BOT_USER_OAUTH_ACCESS_TOKEN }}
+                  channels: nlp-reports
+                  file_path: 'output/reports_${{ needs.get-params.outputs.timestamp }}_*_stats.csv'
+                  file_type: 'csv'
+                  initial_comment: 'NLP Report'
